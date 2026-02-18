@@ -8,6 +8,9 @@ import random
 from torch import optim
 import matplotlib.pyplot as plt
 from typing import List
+
+from tqdm import tqdm
+
 from utils import *
 
 
@@ -39,6 +42,7 @@ class Transformer(nn.Module):
         :param num_layers: number of TransformerLayers to use; can be whatever you want
         """
         super().__init__()
+        self.tok_emb = nn.Embedding(num_embeddings=vocab_size, embedding_dim=d_model)
         self.pos_emb = PositionalEncoding(d_model=d_model, num_positions=num_positions, batched=True)
         self.layers = nn.ModuleList([
             TransformerLayer(d_model=d_model, d_internal=d_internal) for _ in range(num_layers)
@@ -52,13 +56,14 @@ class Transformer(nn.Module):
         :return: A tuple of the softmax log probabilities (should be a 20x3 matrix) and a list of the attention
         maps you use in your layers (can be variable length, but each should be a 20x20 matrix)
         """
-        x = self.pos_emb(indices) # [batch size, seq len, embedding dim]
+        x = self.tok_emb(indices)
+        x = self.pos_emb(x) # [batch size, seq len, embedding dim]
         attn_weight_list = []
         for layer in self.layers:
             x, attn_weight = layer(x) # [batch size, seq len, embedding dim], [batch size, seq len, seq len]
-            attn_weight_list.append(attn_weight)
+            attn_weight_list.append(attn_weight.squeeze())
         logits = self.lm_head(x)
-        prob = nn.functional.softmax(logits, dim=-1)
+        prob = nn.functional.log_softmax(logits, dim=-1).squeeze()
         return prob, attn_weight_list
 
 
@@ -82,6 +87,13 @@ class TransformerLayer(nn.Module):
 
         self.up_proj = nn.Linear(d_model, 4 * d_model)
         self.down_proj = nn.Linear(4 * d_model, d_model)
+
+        torch.nn.init.kaiming_uniform_(self.q_proj.weight)
+        torch.nn.init.kaiming_uniform_(self.k_proj.weight)
+        torch.nn.init.kaiming_uniform_(self.v_proj.weight)
+        torch.nn.init.kaiming_uniform_(self.o_proj.weight)
+        torch.nn.init.kaiming_uniform_(self.up_proj.weight)
+        torch.nn.init.kaiming_uniform_(self.down_proj.weight)
 
     def forward(self, input_vecs):
         res = input_vecs
@@ -138,29 +150,50 @@ class PositionalEncoding(nn.Module):
 
 # This is a skeleton for train_classifier: you can implement this however you want
 def train_classifier(args, train, dev):
-    raise Exception("Not fully implemented yet")
+    seed = 42
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
 
-    # The following code DOES NOT WORK but can be a starting point for your implementation
-    # Some suggested snippets to use:
-    model = Transformer(...)
+    model = Transformer(vocab_size=27,
+                        num_positions=20,
+                        d_model=128,
+                        d_internal=128,
+                        num_classes=3,
+                        num_layers=1)
     model.zero_grad()
     model.train()
-    optimizer = optim.Adam(model.parameters(), lr=1e-4)
 
     num_epochs = 10
-    for t in range(0, num_epochs):
-        loss_this_epoch = 0.0
-        random.seed(t)
+    batch_size = 128
+
+    optimizer = optim.Adam(model.parameters(), lr=1e-3)
+    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=num_epochs)
+
+    for t in tqdm(range(0, num_epochs)):
         # You can use batching if you'd like
         ex_idxs = [i for i in range(0, len(train))]
         random.shuffle(ex_idxs)
         loss_fcn = nn.NLLLoss()
-        for ex_idx in ex_idxs:
-            loss = loss_fcn(...) # TODO: Run forward and compute loss
-            # model.zero_grad()
-            # loss.backward()
-            # optimizer.step()
-            loss_this_epoch += loss.item()
+        for i in tqdm(range(0, len(ex_idxs), batch_size)):
+            batch_idx = ex_idxs[i:i+batch_size]
+            batch = [train[idx] for idx in batch_idx]
+            x = torch.stack([b.input_tensor for b in batch])
+            y = torch.stack([b.output_tensor for b in batch])
+
+            # forward
+            log_prob, attn_weight_list = model(x)
+
+            # loss
+            loss = loss_fcn(log_prob.reshape(-1, log_prob.size(-1)), y.reshape(-1))
+
+            # backward
+            optimizer.zero_grad()
+            loss.backward()
+
+            # step
+            optimizer.step()
+        scheduler.step()
     model.eval()
     return model
 
