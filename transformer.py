@@ -167,7 +167,7 @@ def train_classifier(args, train, dev):
     num_epochs = 10
     batch_size = 128
 
-    optimizer = optim.Adam(model.parameters(), lr=1e-3)
+    optimizer = optim.AdamW(model.parameters(), lr=1e-3)
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=num_epochs)
 
     for t in tqdm(range(0, num_epochs)):
