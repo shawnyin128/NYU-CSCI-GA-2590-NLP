@@ -9,8 +9,6 @@ from torch import optim
 import matplotlib.pyplot as plt
 from typing import List
 
-from tqdm import tqdm
-
 from utils import *
 
 
@@ -170,12 +168,12 @@ def train_classifier(args, train, dev):
     optimizer = optim.AdamW(model.parameters(), lr=1e-3)
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=num_epochs)
 
-    for t in tqdm(range(0, num_epochs)):
+    for t in range(0, num_epochs):
         # You can use batching if you'd like
         ex_idxs = [i for i in range(0, len(train))]
         random.shuffle(ex_idxs)
         loss_fcn = nn.NLLLoss()
-        for i in tqdm(range(0, len(ex_idxs), batch_size)):
+        for i in range(0, len(ex_idxs), batch_size):
             batch_idx = ex_idxs[i:i+batch_size]
             batch = [train[idx] for idx in batch_idx]
             x = torch.stack([b.input_tensor for b in batch])
