@@ -47,6 +47,18 @@ class UniformLanguageModel(LanguageModel):
         return np.log(1.0/self.voc_size) * len(next_chars)
 
 
+class RMSNorm(nn.Module):
+    def __init__(self, d_model, eps=1e-6):
+        super().__init__()
+        self.eps = eps
+        self.weight = nn.Parameter(torch.ones(d_model))
+
+    def forward(self, x):
+        # normalize on hidden dim
+        rms = torch.rsqrt(x.pow(2).mean(dim=-1, keepdim=True) + self.eps)
+        return x * rms * self.weight
+
+
 class PositionalEncoding(nn.Module):
     def __init__(self, d_model: int, num_positions: int=20, batched=False):
         """
@@ -69,7 +81,7 @@ class PositionalEncoding(nn.Module):
         """
         # Second-to-last dimension will always be sequence length
         input_size = x.shape[-2]
-        indices_to_embed = torch.tensor(np.asarray(range(0, input_size))).type(torch.LongTensor)
+        indices_to_embed = torch.arange(0, input_size, device=x.device, dtype=torch.long)
         if self.batched:
             # Use unsqueeze to form a [1, seq len, embedding dim] tensor -- broadcasting will ensure that this
             # gets added correctly across the batch
@@ -100,6 +112,9 @@ class TransformerLayer(nn.Module):
         self.up_proj = nn.Linear(d_model, 4 * d_model)
         self.down_proj = nn.Linear(4 * d_model, d_model)
 
+        self.input_layer_norm = RMSNorm(d_model)
+        self.post_attention_norm = RMSNorm(d_model)
+
         torch.nn.init.kaiming_uniform_(self.q_proj.weight)
         torch.nn.init.kaiming_uniform_(self.k_proj.weight)
         torch.nn.init.kaiming_uniform_(self.v_proj.weight)
@@ -110,9 +125,10 @@ class TransformerLayer(nn.Module):
     def forward(self, input_vecs):
         N, D = input_vecs.size()
         res = input_vecs
-        q_state = self.q_proj(input_vecs) # [N, d_internal]
-        k_state = self.k_proj(input_vecs) # [N, d_internal]
-        v_state = self.v_proj(input_vecs) # [N, d_internal]
+        normed = self.input_layer_norm(input_vecs)
+        q_state = self.q_proj(normed) # [N, d_internal]
+        k_state = self.k_proj(normed) # [N, d_internal]
+        v_state = self.v_proj(normed) # [N, d_internal]
 
         # split into multihead
         q_state = q_state.view(N, self.n_heads, self.head_dim).transpose(0, 1)
@@ -135,7 +151,8 @@ class TransformerLayer(nn.Module):
         output = self.o_proj(attn_output) + res # [N, d_model]
 
         res = output
-        up_state = self.up_proj(output)
+        normed = self.post_attention_norm(output)
+        up_state = self.up_proj(normed)
         up_state = nn.functional.silu(up_state)
         down_state = self.down_proj(up_state)
         output = down_state + res
@@ -172,9 +189,11 @@ class NeuralLanguageModel(LanguageModel):
 
         with torch.no_grad():
             max_len = self.pos_emb.emb.num_embeddings
+            device = self.tok_emb.weight.device
             indices = torch.tensor(
                 [self.vocab_index.index_of(c) for c in context[-max_len:]],
-                dtype=torch.long
+                dtype=torch.long,
+                device=device
             )
             log_probs, _ = self.forward(indices)
             return log_probs[-1].detach().cpu().numpy()
@@ -214,6 +233,11 @@ def train_lm(args, train_text, dev_text, vocab_index):
         num_classes=vocab_size,
         num_layers=4
     )
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model.tok_emb = model.tok_emb.to(device)
+    model.pos_emb = model.pos_emb.to(device)
+    model.layers = model.layers.to(device)
+    model.lm_head = model.lm_head.to(device)
 
     params = (
         list(model.tok_emb.parameters()) +
@@ -229,7 +253,7 @@ def train_lm(args, train_text, dev_text, vocab_index):
     sos_idx = vocab_index.index_of(" ")
     num_epochs = 10
 
-    for epoch in tqdm(range(num_epochs)):
+    for epoch in range(num_epochs):
         starts = list(range(0, len(train_ids) - chunk_len + 1, chunk_len))
         np.random.shuffle(starts)
         total_loss = 0.0
@@ -240,6 +264,8 @@ def train_lm(args, train_text, dev_text, vocab_index):
 
             x = torch.tensor(input_ids, dtype=torch.long)
             y = torch.tensor(target_ids, dtype=torch.long)
+            x = x.to(device)
+            y = y.to(device)
 
             log_probs, _ = model.forward(x)
             loss = loss_fcn(log_probs, y)
@@ -251,6 +277,6 @@ def train_lm(args, train_text, dev_text, vocab_index):
             total_loss += float(loss.item())
 
         avg_loss = total_loss / max(1, len(starts))
-        print("Epoch %d/%d, avg train NLL: %.4f" % (epoch + 1, num_epochs, avg_loss))
+        # print("Epoch %d/%d, avg train NLL: %.4f" % (epoch + 1, num_epochs, avg_loss))
 
     return model
