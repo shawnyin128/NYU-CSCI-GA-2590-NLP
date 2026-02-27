@@ -3,7 +3,6 @@ import torch
 import torch.nn as nn
 import math
 import numpy as np
-from tqdm import tqdm
 
 
 class LanguageModel(object):
