@@ -1,4 +1,3 @@
-import datasets
 from datasets import load_dataset
 from transformers import AutoTokenizer
 from torch.utils.data import DataLoader
@@ -126,6 +125,17 @@ def create_transformed_dataloader(args, dataset, debug_transformation):
         exit()
 
     transformed_dataset = dataset["test"].map(custom_transform, load_from_cache_file=False)
+    
+    # # word error rate
+    # original_texts = dataset["test"]["text"]
+    # transformed_texts = transformed_dataset["text"]
+    # total_wer = 0.0
+    # for original_text, transformed_text in zip(original_texts, transformed_texts):
+    #     original_tokens = original_text.lower().split()
+    #     transformed_tokens = transformed_text.lower().split()
+    #     total_wer += edit_distance(original_tokens, transformed_tokens) / max(1, len(original_tokens))
+    # print(f"Average WER: {total_wer / len(original_texts):.4f}")
+
     transformed_tokenized_dataset = transformed_dataset.map(tokenize_function, batched=True, load_from_cache_file=False)
     transformed_tokenized_dataset = transformed_tokenized_dataset.remove_columns(["text"])
     transformed_tokenized_dataset = transformed_tokenized_dataset.rename_column("label", "labels")
