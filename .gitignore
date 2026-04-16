@@ -1,0 +1,10 @@
+# Model checkpoints
+release/part-2/best/
+release/part-2/checkpoints/
+*.safetensors
+
+# Binary data
+*.pkl
+
+# OS files
+.DS_Store

@@ -5,7 +5,10 @@ from tqdm import tqdm
 import torch
 import torch.nn as nn
 import numpy as np
-import wandb
+try:
+    import wandb
+except ImportError:
+    wandb = None
 
 from t5_utils import initialize_model, initialize_optimizer_and_scheduler, save_model, load_model_from_checkpoint, setup_wandb
 from transformers import GenerationConfig
@@ -48,6 +51,10 @@ def get_args():
     parser.add_argument('--batch_size', type=int, default=16)
     parser.add_argument('--test_batch_size', type=int, default=16)
 
+    # DEBUG flag
+    parser.add_argument('--debug_generation', action='store_true',
+                        help="Print first batch of generated SQL during eval")
+
     args = parser.parse_args()
     return args
 
@@ -56,16 +63,17 @@ def train(args, model, train_loader, dev_loader, optimizer, scheduler):
     epochs_since_improvement = 0
 
     model_type = 'ft' if args.finetune else 'scr'
+    experiment_name = args.experiment_name
     checkpoint_dir = os.path.join('checkpoints', f'{model_type}_experiments', args.experiment_name)
     gt_sql_path = os.path.join(f'data/dev.sql')
-    gt_record_path = os.path.join(f'records/dev_gt_records.pkl')
+    gt_record_path = os.path.join(f'records/ground_truth_dev.pkl')
     model_sql_path = os.path.join(f'results/t5_{model_type}_{experiment_name}_dev.sql')
     model_record_path = os.path.join(f'records/t5_{model_type}_{experiment_name}_dev.pkl')
     for epoch in range(args.max_n_epochs):
         tr_loss = train_epoch(args, model, train_loader, optimizer, scheduler)
         print(f"Epoch {epoch}: Average train loss was {tr_loss}")
 
-        eval_loss, record_f1, record_em, sql_em, error_rate = eval_epoch(args, model, dev_loader,
+        eval_loss, record_em, record_f1, sql_em, error_rate = eval_epoch(args, model, dev_loader,
                                                                          gt_sql_path, model_sql_path,
                                                                          gt_record_path, model_record_path)
         print(f"Epoch {epoch}: Dev loss: {eval_loss}, Record F1: {record_f1}, Record EM: {record_em}, SQL EM: {sql_em}")
@@ -138,16 +146,79 @@ def eval_epoch(args, model, dev_loader, gt_sql_pth, model_sql_path, gt_record_pa
     should both provide good results. If you find that this component of evaluation takes too long with your compute,
     we found the cross-entropy loss (in the evaluation set) to be well (albeit imperfectly) correlated with F1 performance.
     '''
-    # TODO
     model.eval()
-    return 0, 0, 0, 0, 0
+    tokenizer = dev_loader.dataset.tokenizer
+    criterion = nn.CrossEntropyLoss()
+    total_loss = 0
+    total_tokens = 0
+    generated_sql = []
+
+    with torch.no_grad():
+        for encoder_input, encoder_mask, decoder_input, decoder_targets, initial_decoder_inputs in tqdm(dev_loader):
+            encoder_input = encoder_input.to(DEVICE)
+            encoder_mask = encoder_mask.to(DEVICE)
+            decoder_input = decoder_input.to(DEVICE)
+            decoder_targets = decoder_targets.to(DEVICE)
+            initial_decoder_inputs = initial_decoder_inputs.to(DEVICE)
+
+            logits = model(
+                input_ids=encoder_input,
+                attention_mask=encoder_mask,
+                decoder_input_ids=decoder_input,
+            )['logits']
+
+            non_pad = decoder_targets != PAD_IDX
+            loss = criterion(logits[non_pad], decoder_targets[non_pad])
+            num_tokens = torch.sum(non_pad).item()
+            total_loss += loss.item() * num_tokens
+            total_tokens += num_tokens
+
+            generated_ids = model.generate(
+                input_ids=encoder_input,
+                attention_mask=encoder_mask,
+                do_sample=False,
+                max_new_tokens=512,
+            )
+            decoded_batch = tokenizer.batch_decode(generated_ids, skip_special_tokens=True)
+            # DEBUG: print first batch of generated SQL
+            if args.debug_generation and len(generated_sql) == 0:
+                for i, sql in enumerate(decoded_batch):
+                    print(f"  GEN[{i}]: {sql[:150]}")
+            generated_sql.extend(decoded_batch)
+
+    save_queries_and_records(generated_sql, model_sql_path, model_record_path)
+    sql_em, record_em, record_f1, error_msgs = compute_metrics(
+        gt_sql_pth, model_sql_path, gt_record_path, model_record_path
+    )
+    eval_loss = total_loss / total_tokens
+    error_rate = sum(error_msg != "" for error_msg in error_msgs) / len(error_msgs)
+
+    return eval_loss, record_em, record_f1, sql_em, error_rate
         
 def test_inference(args, model, test_loader, model_sql_path, model_record_path):
     '''
     You must implement inference to compute your model's generated SQL queries and its associated 
     database records. Implementation should be very similar to eval_epoch.
     '''
-    pass
+    model.eval()
+    tokenizer = test_loader.dataset.tokenizer
+    generated_sql = []
+
+    with torch.no_grad():
+        for encoder_input, encoder_mask, initial_decoder_inputs in tqdm(test_loader):
+            encoder_input = encoder_input.to(DEVICE)
+            encoder_mask = encoder_mask.to(DEVICE)
+            initial_decoder_inputs = initial_decoder_inputs.to(DEVICE)
+
+            generated_ids = model.generate(
+                input_ids=encoder_input,
+                attention_mask=encoder_mask,
+                do_sample=False,
+                max_new_tokens=512,
+            )
+            generated_sql.extend(tokenizer.batch_decode(generated_ids, skip_special_tokens=True))
+
+    save_queries_and_records(generated_sql, model_sql_path, model_record_path)
 
 def main():
     # Get key arguments
@@ -172,19 +243,20 @@ def main():
     experiment_name = args.experiment_name
     model_type = 'ft' if args.finetune else 'scr'
     gt_sql_path = os.path.join(f'data/dev.sql')
-    gt_record_path = os.path.join(f'records/dev_gt_records.pkl')
+    gt_record_path = os.path.join(f'records/ground_truth_dev.pkl')
     model_sql_path = os.path.join(f'results/t5_{model_type}_{experiment_name}_dev.sql')
     model_record_path = os.path.join(f'records/t5_{model_type}_{experiment_name}_dev.pkl')
     dev_loss, dev_record_em, dev_record_f1, dev_sql_em, dev_error_rate = eval_epoch(args, model, dev_loader,
                                                                                     gt_sql_path, model_sql_path,
                                                                                     gt_record_path, model_record_path)
-    print("Dev set results: Loss: {dev_loss}, Record F1: {dev_record_f1}, Record EM: {dev_record_em}, SQL EM: {dev_sql_em}")
+    print(f"Dev set results: Loss: {dev_loss}, Record F1: {dev_record_f1}, Record EM: {dev_record_em}, SQL EM: {dev_sql_em}")
     print(f"Dev set results: {dev_error_rate*100:.2f}% of the generated outputs led to SQL errors")
 
-    # Test set
-    model_sql_path = os.path.join(f'results/t5_{model_type}_{experiment_name}_test.sql')
-    model_record_path = os.path.join(f'records/t5_{model_type}_{experiment_name}_test.pkl')
-    test_inference(args, model, test_loader, model_sql_path, model_record_path)
+    # dead lock found during training
+    # # Test set
+    # model_sql_path = os.path.join(f'results/t5_{model_type}_{experiment_name}_test.sql')
+    # model_record_path = os.path.join(f'records/t5_{model_type}_{experiment_name}_test.pkl')
+    # test_inference(args, model, test_loader, model_sql_path, model_record_path)
 
 if __name__ == "__main__":
     main()
